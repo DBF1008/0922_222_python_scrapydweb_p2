@@ -35,6 +35,73 @@ project = projectname
 folder_project_dict = {}
 
 
+# Filenames in zip files created on Windows (e.g. Win7/Win10 CN with cp936/GBK encoding)
+# are stored without the UTF-8 flag, so in PY3 zipfile decodes them as cp437 and produces
+# mojibake like 'demo - ╕▒▒╛', or even illegal pathnames with surrogates like
+# '/tmp/scrapydweb-uncompress-xxx/\udc8b\udc8billegal', which would break
+# os.walk()/os.path.exists() and the error message rendering afterwards.
+SURROGATE_PATTERN = re.compile(r'[\ud800-\udfff]')
+
+
+def normalize_zip_member_name(name):
+    """Recover the original name of a zip member and normalize it to a legal relative pathname."""
+    # Zip members from Windows may use backslashes as the pathname separator.
+    name = name.replace('\\', '/')
+    try:
+        raw = name.encode('cp437')
+    except UnicodeEncodeError:
+        # Properly decoded as UTF-8 (with the UTF-8 flag set), or containing non-cp437 chars.
+        pass
+    else:
+        # Decoded as cp437 by zipfile since the UTF-8 flag is not set,
+        # try to recover the original encoding.
+        # Note that UTF-8 bytes of Chinese characters are often valid GBK as well,
+        # whereas GBK bytes are almost never valid UTF-8, so try UTF-8 first.
+        for encoding in ('utf-8', 'gbk'):
+            try:
+                name = raw.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+            break
+    # Replace surrogates and other illegal characters to get a valid pathname,
+    # e.g. '\udc8b\udc8billegal' which raises UnicodeEncodeError on encode('utf-8')
+    name = SURROGATE_PATTERN.sub('_', name)
+    # Strip out illegal parts to avoid uncompressing outside the tmpdir.
+    parts = [part for part in name.split('/') if part not in ('', '.', '..')]
+    return '/'.join(parts)
+
+
+def extract_zip_to_tmpdir(zip_file, tmpdir, logger=None):
+    """Extract a zip file in PY3, dealing with non-UTF-8 and illegal filenames from Windows."""
+    for name in zip_file.namelist():
+        normalized_name = normalize_zip_member_name(name)
+        if not normalized_name:
+            continue
+        if normalized_name != name and logger:
+            logger.debug("Normalize zip member name %s to %s",
+                         safe_path_for_display(name), safe_path_for_display(normalized_name))
+        filepath = os.path.join(tmpdir, normalized_name)
+        if name.endswith(('/', '\\')):
+            # zipfile from Windows "send to zipped" would meet the inner folder first
+            mkdir_p(filepath)
+            continue
+        dirpath = os.path.dirname(filepath)
+        if dirpath:
+            mkdir_p(dirpath)
+        with zip_file.open(name) as src, io.open(filepath, 'wb') as dst:
+            copyfileobj(src, dst)
+
+
+def safe_path_for_display(path):
+    """Convert a path to a utf-8-safe string for logging and error messages,
+    in case it contains surrogates from illegal filenames."""
+    try:
+        path.encode('utf-8')
+    except UnicodeEncodeError:
+        return path.encode('utf-8', 'backslashreplace').decode('utf-8')
+    return path
+
+
 class DeployView(BaseView):
 
     def __init__(self):
@@ -375,7 +442,11 @@ class DeployUploadView(BaseView):
                             # temp\\scrapydweb-uncompress-qrcyc0\\demo7/demo/'
                             mkdir_p(filepath_utf8)
                 else:
-                    f.extractall(tmpdir)
+                    # f.extractall(tmpdir) would uncompress filenames from Windows
+                    # (cp936/GBK without the UTF-8 flag) into mojibake or illegal
+                    # pathnames with surrogates, which breaks the scrapy.cfg searching
+                    # and the error message rendering afterwards.
+                    extract_zip_to_tmpdir(f, tmpdir, logger=self.logger)
         else:  # tar.gz
             with tarfile.open(filepath, 'r') as tar:  # Open for reading with transparent compression (recommended).
                 tar.extractall(tmpdir)
@@ -390,11 +461,21 @@ class DeployUploadView(BaseView):
     def search_scrapy_cfg_path(self, search_path, func_walk=os.walk, retry=True):
         try:
             for dirpath, dirnames, filenames in func_walk(search_path):
-                self.scrapy_cfg_searched_paths.append(os.path.abspath(dirpath))
-                self.scrapy_cfg_path = os.path.abspath(os.path.join(dirpath, 'scrapy.cfg'))
-                if os.path.exists(self.scrapy_cfg_path):
-                    self.logger.debug("scrapy_cfg_path: %s", self.scrapy_cfg_path)
-                    return
+                # Store utf-8-safe paths only, since they would be shown in the error page
+                self.scrapy_cfg_searched_paths.append(safe_path_for_display(os.path.abspath(dirpath)))
+                try:
+                    scrapy_cfg_path = os.path.abspath(os.path.join(dirpath, 'scrapy.cfg'))
+                    if os.path.exists(scrapy_cfg_path):
+                        self.scrapy_cfg_path = scrapy_cfg_path
+                        self.logger.debug("scrapy_cfg_path: %s", safe_path_for_display(self.scrapy_cfg_path))
+                        return
+                except (UnicodeError, OSError) as err:
+                    # Handle illegal pathnames with surrogates in PY3,
+                    # e.g. '/tmp/scrapydweb-uncompress-xxx/\udc8b\udc8billegal',
+                    # skip it and keep searching a valid project root in other directories
+                    msg = "Ignore illegal pathname %s: %s" % (repr(dirpath), err)
+                    self.logger.error(msg)
+                    flash(msg, self.WARN)
         except UnicodeDecodeError:
             msg = "Found illegal filenames in %s" % search_path
             self.logger.error(msg)
@@ -404,7 +485,7 @@ class DeployUploadView(BaseView):
             else:
                 raise
         else:
-            self.logger.error("scrapy.cfg not found in: %s", search_path)
+            self.logger.error("scrapy.cfg not found in: %s", safe_path_for_display(search_path))
             self.scrapy_cfg_path = ''
 
     def build_egg(self):
