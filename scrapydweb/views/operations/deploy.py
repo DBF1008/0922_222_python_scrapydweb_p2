@@ -352,6 +352,62 @@ class DeployUploadView(BaseView):
     # UnicodeEncodeError: 'ascii' codec can't encode characters in position 7-8: ordinal not in range(128)
     # macOS + PY2 would raise OSError: Illegal byte sequence
     # Ubuntu + PY2 would raise UnicodeDecodeError in search_scrapy_cfg_path() though f.extractall(tmpdir) works well
+    @staticmethod
+    def decode_zip_filename(filename, flag_bits=0):
+        # Zip entries created on Windows CN store filenames as cp936/gbk bytes without the UTF-8 flag,
+        # and zipfile in PY3 would decode them as cp437 producing mojibake like '╕▒▒▒'.
+        # Try to recover the original filename from the raw bytes.
+        if flag_bits & 0x800:
+            # The UTF-8 flag is set and zipfile has decoded the filename from utf-8 properly
+            return filename
+        try:
+            filename_bytes = filename.encode('cp437')
+        except UnicodeEncodeError:
+            # A genuine unicode filename, or one containing surrogates already
+            return filename
+        for encoding in ('utf-8', 'gbk'):
+            try:
+                return filename_bytes.decode(encoding)
+            except UnicodeDecodeError:
+                pass
+        return filename
+
+    @staticmethod
+    def sanitize_zip_filename(filename):
+        # Normalize separators and strip out illegal parts,
+        # so that the extracted pathname is always valid and utf-8 encodable
+        parts = []
+        for part in filename.replace('\\', '/').split('/'):
+            if part in ('', '.', '..'):
+                continue
+            try:
+                part.encode('utf-8')
+            except UnicodeEncodeError:
+                # e.g. surrogates like '\udc8b' decoded from illegal bytes
+                part = part.encode('utf-8', 'replace').decode('utf-8')
+            parts.append(part)
+        return '/'.join(parts)
+
+    def extract_zip_to_tmpdir(self, zip_file, tmpdir):
+        for info in zip_file.infolist():
+            filename_utf8 = self.sanitize_zip_filename(
+                self.decode_zip_filename(info.filename, info.flag_bits))
+            if not filename_utf8:
+                continue
+            filepath_utf8 = os.path.join(tmpdir, filename_utf8)
+            if info.is_dir() or info.filename.endswith(('/', '\\')):
+                mkdir_p(filepath_utf8)
+                continue
+            dirname = os.path.dirname(filepath_utf8)
+            if dirname and not os.path.isdir(dirname):
+                # zipfile from Windows "send to zipped" would meet the inner folder first
+                mkdir_p(dirname)
+            try:
+                with io.open(filepath_utf8, 'wb') as f_utf8:
+                    copyfileobj(zip_file.open(info), f_utf8)
+            except (IOError, OSError) as err:
+                self.logger.error("Fail to extract %s: %s", repr(info.filename), err)
+
     def uncompress_to_tmpdir(self, filepath):
         self.logger.debug("Uncompressing %s", filepath)
         tmpdir = tempfile.mkdtemp(prefix="scrapydweb-uncompress-")
@@ -375,7 +431,9 @@ class DeployUploadView(BaseView):
                             # temp\\scrapydweb-uncompress-qrcyc0\\demo7/demo/'
                             mkdir_p(filepath_utf8)
                 else:
-                    f.extractall(tmpdir)
+                    # f.extractall(tmpdir) would expand non-UTF-8 filenames from Windows
+                    # into mojibake or surrogate pathnames which break the following steps
+                    self.extract_zip_to_tmpdir(f, tmpdir)
         else:  # tar.gz
             with tarfile.open(filepath, 'r') as tar:  # Open for reading with transparent compression (recommended).
                 tar.extractall(tmpdir)
@@ -387,19 +445,41 @@ class DeployUploadView(BaseView):
         # print(type(tmpdir))
         return tmpdir.decode('utf8') if PY2 else tmpdir
 
+    def is_legal_pathname(self, name):
+        try:
+            name.encode('utf-8')
+        except UnicodeEncodeError:
+            # e.g. surrogates like '\udc8b\udc8b' decoded from illegal bytes b'\x8b\x8b'
+            msg = "Ignore illegal pathname %s" % repr(name)
+            self.logger.error(msg)
+            flash(msg, self.WARN)
+            return False
+        else:
+            return True
+
     def search_scrapy_cfg_path(self, search_path, func_walk=os.walk, retry=True):
         try:
             for dirpath, dirnames, filenames in func_walk(search_path):
+                if not PY2:
+                    # Skip illegal pathnames undecodable in utf-8,
+                    # which would break os.path.exists() and the error reporting below
+                    dirnames[:] = [d for d in dirnames if self.is_legal_pathname(d)]
+                    filenames = [f for f in filenames if self.is_legal_pathname(f)]
                 self.scrapy_cfg_searched_paths.append(os.path.abspath(dirpath))
-                self.scrapy_cfg_path = os.path.abspath(os.path.join(dirpath, 'scrapy.cfg'))
-                if os.path.exists(self.scrapy_cfg_path):
+                try:
+                    scrapy_cfg_path = os.path.abspath(os.path.join(dirpath, 'scrapy.cfg'))
+                    found = os.path.exists(scrapy_cfg_path)
+                except (UnicodeDecodeError, UnicodeEncodeError):
+                    continue
+                if found:
+                    self.scrapy_cfg_path = scrapy_cfg_path
                     self.logger.debug("scrapy_cfg_path: %s", self.scrapy_cfg_path)
                     return
-        except UnicodeDecodeError:
+        except (UnicodeDecodeError, UnicodeEncodeError):
             msg = "Found illegal filenames in %s" % search_path
             self.logger.error(msg)
             flash(msg, self.WARN)
-            if PY2 and retry:
+            if retry:
                 self.search_scrapy_cfg_path(search_path, func_walk=self.safe_walk, retry=False)
             else:
                 raise

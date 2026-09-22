@@ -16,7 +16,8 @@ custom_settings = dict(
     _SCRAPYD_SERVER='127.0.0.1:6800',
     _SCRAPYD_SERVER_AUTH=('admin', '12345'),  # Or None
 
-    LOCAL_SCRAPYD_LOGS_DIR='',  # For LogParser, defaults to the 'logs' directory that resides in current user directory
+    # For LogParser, defaults to the 'logs' directory that resides in current user directory
+    LOCAL_SCRAPYD_LOGS_DIR=os.environ.get('LOCAL_SCRAPYD_LOGS_DIR', ''),
 
     SLACK_TOKEN=os.environ.get('SLACK_TOKEN', ''),
     TELEGRAM_TOKEN=os.environ.get('TELEGRAM_TOKEN', ''),
